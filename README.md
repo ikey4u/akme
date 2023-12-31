@@ -10,20 +10,11 @@ And then you can integrate the certificate into your favorite web server.
 
 ## Usage
 
-You must run akme in administrator/root priviledge, and its usage is given as
-below
+You must run akme in administrator/root priviledge since akme will listen on
+port 80, see usage using `akme -h`.
 
-    akme --domain <domain> --ssldir </path/to/ssldir>
-
-`<domain>` is your website domain such as `example.com` without any prefix
-like `https` or `http`.
-
-`<path/to/ssldir>` is any existed directory (both `.` and `..` are accepted) you
-want to store the generated files which named `<domain>.crt` and `<domain>.key`
-respectively.
-
-Assume your `domain` is `exampmle.com` and your `ssldir` is `/stc/akme`, here is
-an example configuration in nginx
+Assume your `domain` is `exampmle.com` and your `ssldir` is `/etc/akme`, here is
+an example configuration in nginx:
 
     server {
         listen 443 ssl;
@@ -34,3 +25,9 @@ an example configuration in nginx
         ssl_certificate /etc/akme/example.com.crt
         ssl_certificate_key /etc/akme/example.com.key;
     }
+
+## TODO
+
+- implement daemonize mode
+- implement stop, test and log subcommand
+- add test
