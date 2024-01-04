@@ -28,21 +28,32 @@ use crate::error::Result;
 static CHALLENGES: Lazy<Arc<Mutex<HashMap<String, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+fn get_free_tcp_port() -> Option<u16> {
+    (1024..=65535)
+        .find(|x| std::net::TcpListener::bind(("127.0.0.1", *x)).is_ok())
+}
+
 pub struct CertManager {
     // `Sender` cannot be moved out in `Drop`, here we use Option trick to finish that
     stop: Option<Sender<()>>,
     domain: String,
+    emails: Vec<String>,
+    acmedir: String,
+    test_issue: bool,
 }
 
 impl CertManager {
-    pub async fn new<S: AsRef<str>>(domain: S) -> Result<Self> {
+    pub async fn new<A: AsRef<str>, B: AsRef<str>>(
+        domain: A,
+        emails: Vec<String>,
+        acmedir: B,
+        test_issue: bool,
+    ) -> Result<Self> {
         // Start challenge solve server
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 80))
             .await
-            .context(
-            "SSL certificate challenge requires to listen at port 80",
-        )?;
+            .context("cannot listen to port 80")?;
         tokio::spawn(async {
             // HTTP-01 challenge will access URL `http://<YOUR_DOMAIN>/.well-known/acme-challenge/<TOKEN>`,
             // see https://letsencrypt.org/docs/challenge-types/
@@ -58,13 +69,13 @@ impl CertManager {
                 })
                 .await
             {
-                log::error!("Challenge solve server exits with error: {e}");
+                log::error!("challenge solve server exits with error: {e}");
             } else {
-                log::info!("Challenge solve server exits successfully");
+                log::info!("challenge solve server exits successfully");
             }
         });
 
-        log::info!("Wait challenge solve server to start ..");
+        log::info!("wait challenge solve server to start ..");
         let timeout = 5;
         let wait_start_at = Local::now().timestamp();
         loop {
@@ -76,29 +87,48 @@ impl CertManager {
                 bail!("challenge solve server does not start in {timeout} seconds");
             }
         }
-        log::info!("Challenge solve server started");
+        log::info!("challenge solve server started");
 
         Ok(Self {
             stop: Some(tx),
             domain: domain.as_ref().to_owned(),
+            emails,
+            acmedir: acmedir.as_ref().to_owned(),
+            test_issue,
         })
     }
 
     /// Issue or renew an HTTPS certificate pair `(certificate, private_key)`
     pub async fn issue(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        let dir = DirectoryBuilder::new(
-            "https://acme-v02.api.letsencrypt.org/directory".to_string(),
-        )
-        .build()
-        .await?;
-
-        let mut builder = AccountBuilder::new(dir.clone());
-        builder.terms_of_service_agreed(true);
-        let account = builder.build().await?;
-
-        let mut builder = OrderBuilder::new(account);
-        builder.add_dns_identifier(self.domain.clone());
-        let order = builder.build().await?;
+        let (dir, domain) = if self.test_issue {
+            let acme_root_ca = env::var("ACME_ROOT_CA")?;
+            let certbuf = tokio::fs::read(acme_root_ca).await?;
+            let cert = reqwest::Certificate::from_pem(&certbuf)?;
+            let client = reqwest::Client::builder()
+                .add_root_certificate(cert)
+                .build()?;
+            (
+                DirectoryBuilder::new(self.acmedir.clone())
+                    .http_client(client)
+                    .build()
+                    .await?,
+                "example.com",
+            )
+        } else {
+            (
+                DirectoryBuilder::new(self.acmedir.clone()).build().await?,
+                self.domain.as_str(),
+            )
+        };
+        let account = AccountBuilder::new(dir.clone())
+            .contact(self.emails.clone())
+            .terms_of_service_agreed(true)
+            .build()
+            .await?;
+        let order = OrderBuilder::new(account)
+            .add_dns_identifier(domain.to_owned())
+            .build()
+            .await?;
 
         let mut authed = false;
         let authorizations = order.authorizations().await?;
@@ -210,6 +240,12 @@ enum Command {
         /// Your website domain such as `example.com` without any prefix like https or http
         #[arg(long)]
         domain: String,
+        /// Emails of your domain onwers
+        #[arg(long)]
+        email: Option<Vec<String>>,
+        /// ACME directory url, default to the one letsencrypt provides
+        #[arg(long)]
+        acmedir: Option<String>,
         /// An existed directory (both `.` and `..` are accepted) where you want
         /// to store the generated files in which named `<domain>.crt` and
         /// `<domain>.key`, respectively
@@ -224,19 +260,25 @@ enum Command {
     /// Test `--reload` command in `start` subommand
     Test {
         #[arg(long)]
-        reload: String,
+        issue: bool,
+        #[arg(long)]
+        reload: Option<String>,
     },
     /// View akme log
     Log,
 }
 
-pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>>(
+pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>, S: AsRef<str>>(
     domain: D,
+    emails: Vec<String>,
+    acmedir: S,
+    test_issue: bool,
     ssldir: P,
 ) -> Result<()> {
     let (domain, ssldir) = (domain.as_ref(), ssldir.as_ref());
 
-    let certmgr = CertManager::new(&domain).await?;
+    let mgr =
+        CertManager::new(&domain, emails, acmedir.as_ref(), test_issue).await?;
     let certpath = ssldir.join(format!("{}.crt", domain));
     let mut has_idle_message = false;
     loop {
@@ -265,7 +307,7 @@ pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>>(
         }
 
         let skpath = ssldir.join(format!("{}.key", domain));
-        let (cert, sk) = certmgr.issue().await?;
+        let (cert, sk) = mgr.issue().await?;
         let mut f = File::create(&certpath)?;
         f.write_all(cert.as_slice())?;
         let mut f = File::create(&skpath)?;
@@ -277,7 +319,13 @@ pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>>(
             certpath.display(),
             skpath.display()
         );
+
+        if test_issue {
+            break;
+        }
     }
+
+    Ok(())
 }
 
 pub fn init_tracing<P: AsRef<path::Path>, S: AsRef<str>>(
@@ -316,7 +364,7 @@ pub fn init_tracing<P: AsRef<path::Path>, S: AsRef<str>>(
 pub async fn app() -> Result<()> {
     let cli = Cli::parse();
 
-    let logdir = path::Path::new("/var/log/akme");
+    let logdir = path::Path::new("log/akme");
     if !logdir.exists() {
         fs::create_dir_all(logdir).expect("failed to create log directory");
     }
@@ -325,6 +373,8 @@ pub async fn app() -> Result<()> {
     match &cli.command {
         Some(Command::Start {
             domain,
+            email,
+            acmedir,
             ssldir,
             reload,
         }) => {
@@ -333,13 +383,41 @@ pub async fn app() -> Result<()> {
             } else {
                 env::current_dir()?
             };
+
+            let emails = if let Some(email) = email {
+                email.to_owned()
+            } else {
+                vec![]
+            };
+
+            let acmedir = if let Some(acmedir) = acmedir {
+                acmedir.as_str()
+            } else {
+                "https://acme-v02.api.letsencrypt.org/directory"
+            };
+
             ensure!(
                 ssldir.exists(),
                 "ssldir {} does not exist",
                 ssldir.display()
             );
             let ssldir = ssldir.canonicalize()?;
-            akme_start(domain, ssldir).await?
+            akme_start(domain, emails, acmedir, false, ssldir).await?
+        }
+        Some(Command::Test { issue, reload }) => {
+            if *issue {
+                akme_start(
+                    "exapmle.com".to_owned(),
+                    vec!["admin@example.com".to_owned()],
+                    env::var("ACME_DIR_URL").unwrap().to_owned(),
+                    true,
+                    env::current_dir().unwrap(),
+                )
+                .await?
+            }
+            if let Some(reload) = reload {
+                todo!()
+            }
         }
         _ => todo!(),
     }
@@ -353,4 +431,42 @@ pub async fn main() {
         println!("application exits with error: {e:?}");
         std::process::exit(1);
     }
+}
+
+#[tokio::test]
+#[cfg(feature = "dev-ping-domain")]
+async fn ping_domain() {
+    let domain = "example.com".to_owned();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let rsp = domain.clone();
+    let port = get_free_tcp_port().unwrap();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let app = Router::new().route("/", get(|| async { rsp }));
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let rsp = client
+        .get(format!("http://{domain}:{port}"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    _ = tx.send(());
+
+    assert_eq!(domain, rsp);
 }
