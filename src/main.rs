@@ -28,18 +28,12 @@ use crate::error::Result;
 static CHALLENGES: Lazy<Arc<Mutex<HashMap<String, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-fn get_free_tcp_port() -> Option<u16> {
-    (1024..=65535)
-        .find(|x| std::net::TcpListener::bind(("127.0.0.1", *x)).is_ok())
-}
-
 pub struct CertManager {
     // `Sender` cannot be moved out in `Drop`, here we use Option trick to finish that
     stop: Option<Sender<()>>,
     domain: String,
     emails: Vec<String>,
     acmedir: String,
-    test_issue: bool,
 }
 
 impl CertManager {
@@ -47,7 +41,6 @@ impl CertManager {
         domain: A,
         emails: Vec<String>,
         acmedir: B,
-        test_issue: bool,
     ) -> Result<Self> {
         // Start challenge solve server
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -94,13 +87,12 @@ impl CertManager {
             domain: domain.as_ref().to_owned(),
             emails,
             acmedir: acmedir.as_ref().to_owned(),
-            test_issue,
         })
     }
 
     /// Issue or renew an HTTPS certificate pair `(certificate, private_key)`
     pub async fn issue(&self) -> Result<(Vec<u8>, Vec<u8>)> {
-        let (dir, domain) = if self.test_issue {
+        let (dir, domain) = if cfg!(feature = "dev-issue") {
             let acme_root_ca = env::var("ACME_ROOT_CA")?;
             let certbuf = tokio::fs::read(acme_root_ca).await?;
             let cert = reqwest::Certificate::from_pem(&certbuf)?;
@@ -257,13 +249,6 @@ enum Command {
     },
     /// Stop akme server
     Stop,
-    /// Test `--reload` command in `start` subommand
-    Test {
-        #[arg(long)]
-        issue: bool,
-        #[arg(long)]
-        reload: Option<String>,
-    },
     /// View akme log
     Log,
 }
@@ -272,13 +257,11 @@ pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>, S: AsRef<str>>(
     domain: D,
     emails: Vec<String>,
     acmedir: S,
-    test_issue: bool,
     ssldir: P,
 ) -> Result<()> {
     let (domain, ssldir) = (domain.as_ref(), ssldir.as_ref());
 
-    let mgr =
-        CertManager::new(&domain, emails, acmedir.as_ref(), test_issue).await?;
+    let mgr = CertManager::new(&domain, emails, acmedir.as_ref()).await?;
     let certpath = ssldir.join(format!("{}.crt", domain));
     let mut has_idle_message = false;
     loop {
@@ -298,6 +281,9 @@ pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>, S: AsRef<str>>(
         };
 
         if !is_expired {
+            if cfg!(feature = "dev-issue") {
+                panic!("remove your existed test certificate and test again");
+            }
             if !has_idle_message {
                 log::info!("Certificate is valid, and I will go to sleep ...");
                 has_idle_message = true;
@@ -320,7 +306,9 @@ pub async fn akme_start<D: AsRef<str>, P: AsRef<path::Path>, S: AsRef<str>>(
             skpath.display()
         );
 
-        if test_issue {
+        if cfg!(feature = "dev-issue") {
+            _ = tokio::fs::remove_file(certpath).await;
+            _ = tokio::fs::remove_file(skpath).await;
             break;
         }
     }
@@ -402,22 +390,7 @@ pub async fn app() -> Result<()> {
                 ssldir.display()
             );
             let ssldir = ssldir.canonicalize()?;
-            akme_start(domain, emails, acmedir, false, ssldir).await?
-        }
-        Some(Command::Test { issue, reload }) => {
-            if *issue {
-                akme_start(
-                    "exapmle.com".to_owned(),
-                    vec!["admin@example.com".to_owned()],
-                    env::var("ACME_DIR_URL").unwrap().to_owned(),
-                    true,
-                    env::current_dir().unwrap(),
-                )
-                .await?
-            }
-            if let Some(reload) = reload {
-                todo!()
-            }
+            akme_start(domain, emails, acmedir, ssldir).await?
         }
         _ => todo!(),
     }
@@ -434,13 +407,15 @@ pub async fn main() {
 }
 
 #[tokio::test]
-#[cfg(feature = "dev-ping-domain")]
-async fn ping_domain() {
+#[cfg(feature = "dev-check-hosts")]
+async fn dev_check_hosts() {
     let domain = "example.com".to_owned();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let rsp = domain.clone();
-    let port = get_free_tcp_port().unwrap();
+    let port = (1024..=65535)
+        .find(|x| std::net::TcpListener::bind(("127.0.0.1", *x)).is_ok())
+        .unwarp();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .unwrap();
@@ -469,4 +444,18 @@ async fn ping_domain() {
     _ = tx.send(());
 
     assert_eq!(domain, rsp);
+}
+
+#[tokio::test]
+#[cfg(feature = "dev-issue")]
+async fn dev_issue() {
+    let _guard = init_tracing("target", "akme");
+    akme_start(
+        "exapmle.com".to_owned(),
+        vec!["admin@example.com".to_owned()],
+        env::var("ACME_DIR_URL").unwrap().to_owned(),
+        env::current_dir().unwrap(),
+    )
+    .await
+    .unwrap()
 }

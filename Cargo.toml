@@ -23,4 +23,5 @@ x509-certificate = "0.23.1"
 x509-parser = "0.15.1"
 
 [features]
-dev-ping-domain = []
+dev-check-hosts = []
+dev-issue = []
